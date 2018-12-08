@@ -1,0 +1,236 @@
+---
+title: "Exploratory Analysiis of Cancer Genome Atlas Pan-Cancer RNA-seq Data"
+output: html_document
+---
+
+> RNA-seq was developed to profile gene expression and it's able to detect thousands of genes at the same time. This gives the power to comprehensive investigation on biomedical research. One broad application is in study of human cancers. By profiling gene expression, researchers are able to find tumor markers that might be the causes of a specific cancer. The big challenge is a good approach to mine information from Cancer RNA-seq data. Difference on methods used for data analysis and analysis strategy likely leads biomedical researchers to different conclusions.
+
+> In this analysis, we will explore RNA-seq data from Cancer Genome Atlas Pan-Cancer and show one example of investigating RNA-seq data.
+
+```{r}
+##read cancer rna-seq data
+##The original data source: https://archive.ics.uci.edu/ml/machine-learning-databases/00401/TCGA-PANCAN-HiSeq-801x20531.tar.gz
+rna = read.csv("~/Downloads/TCGA-PANCAN-HiSeq-801x20531/data.csv",header = T,row.names = 1)
+dim(rna)
+##801 samples and 20531 genes in total
+
+##read labels of samples
+label = read.csv("Downloads/TCGA-PANCAN-HiSeq-801x20531/labels.csv",header = T,row.names = 1)
+```
+
+```{r}
+##exam data structure
+table(label$Class)
+```
+
+> This example dataset contains five tumor types. BRCA: Breast carcinoma; COAD: Colon adenocarcinoma; KIRC: Kidney renal clear-cell carcinoma; LUAD: Lung adenocarcinoma; PRAD: Rectal adenocarcinoma
+
+> Since it is a very large data dataset and most genes do not express across all samples, we need to filter out some genes before we do downstream analysis. Most genes are not "informative" in our study, see not variable, so we also filter genes that have less variance among samples.
+
+```{r}
+##first filter genes that express across less than 10% samples out
+summary(colMeans(rna))
+
+library(matrixStats)
+summary(colMaxs(as.matrix(rna)))
+
+rna_2 = rna[,colSums(rna>0)>=80]
+
+##second filter out genes that mostly vary across samples
+##Some genes express a low amount across samples but do have high variance. So the mean expression is considered while selecting the variable genes
+expr_mean = apply(rna_2, 2, mean)
+expr_var = apply(rna_2,2,var)
+
+library(ggplot2)
+expr = cbind(expr_mean,expr_var)
+expr=data.frame(expr)
+ggplot(expr,aes(x=expr_mean,y=expr_var))+geom_density2d()
+expr2 = expr[expr_mean>=0.5&expr_var>=1,]
+ggplot(expr2,aes(x=expr_mean,y=expr_var))+geom_density2d()
+
+rna_2=rna_2[,expr_mean>=0.5&expr_var>=1]
+```
+
+> Filtering helps us reduce this dataset to 9095 genes for downstream analysis. However, it is quite a big dataset. Here we employ PCA, tSNE and UMAP to further reduce dimension.
+
+```{r}
+##After filtering, 9095 genes are selected. However, it is still a dataset with a very large dimension
+##First try PCA for dimension reduction
+library("FactoMineR")
+rna_pca <- PCA(rna_2, graph = FALSE)
+
+##Exam principal component analsysi
+library("factoextra")
+eig.val <- get_eigenvalue(rna_pca)
+head(eig.val)
+
+fviz_eig(rna_pca, addlabels = TRUE, ylim = c(0, 20))
+
+##To keep more than 80% variance, at least 141 PC components have to been chosen.
+rna_pca_lay=data.frame(rna_pca$svd$U)[,1:2]
+rna_pca_lay=cbind(rna_pca_lay,label$Class)
+colnames(rna_pca_lay)=c("PC1","PC2","Class")
+
+##Another dimension reduction technique is tSNE
+library(Rtsne)
+set.seed(754)
+
+##we set "pca=T" to let algorithm first runs PCA and then performs tSNE on PCA spaces
+tsne_out <- Rtsne(rna_2, is_distance=F,pca = T, perplexity=30, verbose = TRUE)
+rna_tsne=data.frame(tsne_out$Y)
+rna_tsne=cbind(rna_tsne,label$Class)
+colnames(rna_tsne)=c("tSNE1","tSNE2","Class")
+
+##UMAP was recently developed for dimension reduction
+library(umap)
+rna_umap= umap(rna_2, method="umap-learn")
+rna_umap_lay=data.frame(rna_umap$layout)
+rna_umap_lay=cbind(rna_umap_lay,label$Class)
+colnames(rna_umap_lay)=c("UMAP1","UMAP2","Class")
+
+##Visualize data on two PCA spaces, two tSNE spaces and two UMAP spaces
+ggplot(rna_pca_lay,aes(x=PC1,y=PC2,col=Class))+geom_point()
+ggplot(rna_tsne,aes(x=tSNE1,y=tSNE2,col=Class))+geom_point()
+ggplot(rna_umap_lay,aes(x=UMAP1,y=UMAP2,col=Class))+geom_point()
+```
+
+> Both tSNE and UMAP showed better dimension reduction than PCA. Efficiently, tSNE and UMAP can directly work on a high dimension dataset (9095 variable genes in this case). The reduced dimension by UMAP was used in the following analysis.
+
+> If the 2 UMAP spaces represent the dataset enough, it is easy to think that we can cluster samples simply based on how close to or far from other samples by measuring 2D UMAP distance.
+
+```{r}
+##Can samples be reclustered by only using two UMAP spaces?
+d=dist(rna_umap_lay[,1:2],method = "euclidean")
+hc=hclust(d,method = "ward.D")
+rna_cluster=cutree(hc,10)
+rna_umap_lay=cbind(rna_umap_lay,paste("Subcluster",as.character(rna_cluster),sep = "_"))
+colnames(rna_umap_lay)[4]="Subcluster"
+ggplot(rna_umap_lay,aes(x=UMAP1,y=UMAP2,col=Subcluster))+geom_point()
+```
+
+> Density based clustering is another approach to cluster samples. However, it is not used in this case. This is because five major tumor types form five dense clusters and are separated from the other four. Density based clustering will not be able to find subclusters in this case.
+
+> Cluster Validation
+
+```{r}
+##Validate if these subclusters are biological subclusters
+##Find 1 logFold Change differential genes for each subcluster
+DE=list()
+for (i in c(1:10)) {
+  de=rna_2[,log(apply(rna_2[rna_cluster==i,], 2,mean))-log(apply(rna_2[!rna_cluster==i,], 2,mean))>=1]
+  #print(ncol(de))
+  pvalue=c()
+  for (j in c(1:ncol(de))) {
+    t=t.test(de[rna_cluster==1,j],de[!rna_cluster==1,j])$p.value
+    pvalue=c(pvalue,t)
+  }
+  de=de[,pvalue<0.01]
+  pvalue=pvalue[pvalue<0.01]
+  de=de[,order(pvalue,decreasing = F)]
+  print(ncol(de))
+  #print(length(pvalue))
+  name <- paste('Subcluster',i,sep='_')
+  DE[[name]]=de
+}
+
+##The number of significant differential genes in each subcluster exceeds 10, suggesting these subclusters are biological subclusters
+de=data.frame(DE$Subcluster_1)
+for (i in c(2:10)) {
+  de=cbind(de,DE[[i]])
+}
+
+agg_de = aggregate(de,by = list(rna_cluster),FUN = mean)
+agg_de = agg_de[,-(1)]
+
+library(pheatmap)
+de=scale(de)
+de[de>=3]=3
+de[de<=-3]=3
+pheatmap(de,annotation_row = rna_umap_lay[,3:4],cluster_rows = hc,cluster_cols = F,fontsize_col = 0.00001,fontsize_row = 0.00001)
+
+agg_de=scale(agg_de)
+pheatmap(agg_de,cluster_rows = F,cluster_cols = F,fontsize_col = 0.00001,fontsize_row = 0.00001)
+##The averaged gene expression heatmap also shows these subclusters are distinctly biological groups
+```
+
+> It is consensus that one single gene doesn't define a cancer. Genes cooperates to perform a sepcific function. The cause of cancer is disregulation or malfunction of a group of genes. Therefore, the next question is whether we can use the differential genes to find gene clusters and construct gene network to see how genes work as a group.
+
+> One simple idea is building gene covariance network. Here, leave-one-out approach is applied to exam the perturbation of gene network under one cancer scenario.
+
+```{r}
+de=data.frame(DE$Subcluster_1)
+for (i in c(2:10)) {
+  de=cbind(de,DE[[i]])
+}
+
+de = de[!duplicated(colnames(de))]
+agg_de = aggregate(de,by = list(rna_cluster),FUN = mean)
+agg_de = agg_de[,-(1)]
+
+gene_net = cov(agg_de,method = "spearman")
+d_gene_net = dist(gene_net,method = "euclidean")
+hc_gene_net=hclust(d_gene_net,method = "ward.D")
+
+gene_cluster=cutree(hc_gene_net,7)
+gene_cluster=data.frame(as.character(gene_cluster))
+rownames(gene_cluster)=rownames(gene_net)
+colnames(gene_cluster)="Gene_cluster"
+
+gene_net_s1 = cov(agg_de[-(1),],method = "spearman")
+gene_net_s2 = cov(agg_de[-(2),],method = "spearman")
+gene_net_s5 = cov(agg_de[-(5),],method = "spearman")
+
+pheatmap(gene_net,cluster_rows = hc_gene_net,cluster_cols = hc_gene_net,fontsize_row = 0.00001,fontsize_col = 0.00001,annotation_row = gene_cluster,annotation_col = gene_cluster)
+
+pheatmap(gene_net-gene_net_s1,cluster_rows = hc_gene_net,cluster_cols = hc_gene_net,fontsize_row = 0.00001,fontsize_col = 0.00001,annotation_row = gene_cluster,annotation_col = gene_cluster)
+
+pheatmap(gene_net-gene_net_s2,cluster_rows = hc_gene_net,cluster_cols = hc_gene_net,fontsize_row = 0.00001,fontsize_col = 0.00001,annotation_row = gene_cluster,annotation_col = gene_cluster)
+
+pheatmap(gene_net-gene_net_s5,cluster_rows = hc_gene_net,cluster_cols = hc_gene_net,fontsize_row = 0.00001,fontsize_col = 0.00001,annotation_row = gene_cluster,annotation_col = gene_cluster)
+```
+
+> The heatmaps above give us ideas that occurance of tumors can be result from 1) reclustering of genes; 2) strengthening or weakening of gene clusters
+
+> Finally, we will try to classifiy cancer types by building a simple classifier model.
+
+```{r}
+##First randomly subset 80% samples from each subcluster as train dataset and the rest 20% as test dataset
+library(dplyr)
+train = rna_2[,colnames(rna_2)%in%colnames(agg_de)]
+train$Subcluster=as.numeric(rna_cluster)
+train$Type=label$Class
+train$Samples=rownames(train)
+test = train %>% group_by(Subcluster) %>% sample_frac(0.2)
+train = train[!train$Samples%in%test$Samples,]
+```
+
+> Linear Classification
+
+```{r}
+library(MASS)
+fit = lda(Subcluster~., data=train[,1:ncol(agg_de)+1])
+
+lda_prediction = predict(fit, test[,1:ncol(agg_de)])$class
+table(lda_prediction,test$Subcluster)
+table(lda_prediction,test$Type)
+```
+
+> Gradient Boosting Classifier
+
+```{r}
+library(gbm)
+boost=gbm(Subcluster ~ . ,data = train[,1:ncol(agg_de)+1],distribution = "multinomial",n.trees = 1000)
+gbm_prediction = predict(boost, test[,1:ncol(agg_de)],n.trees=1000)
+gbm_prediction = data.frame(gbm_prediction[1:160,1:10,1])
+colnames(gbm_prediction)=c(1:10)
+gbm_pred=c()
+for (i in c(1:nrow(gbm_prediction))) {
+  gbm_pred=c(gbm_pred,which.max(gbm_prediction[i,]))
+}
+table(gbm_pred,test$Subcluster)
+table(gbm_pred,test$Type)
+```
+
+> Summary
+In this tutorial, we used cancer gene expression data to illustrate a workflow of RNA-seq data analysis. We dealt with Data preprocessing, Dimension reduction and Clustering. We also further examed a concept of gene network by a simple approach and discussed use of two classifier models in cancer identification. 
+Though there are many advanced analysis approaches and machine learning techniques for gene expression analysis, we still believe understanding a simple workflow can serve better novel discovery in biomedical researches. This is even true for biomedical researchers who have limited knowledge on data analysis but are very familiar with biological systems.
